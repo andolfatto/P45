@@ -1,0 +1,387 @@
+#export OMP_NUM_THREADS=1
+from dolfin import *
+import numpy as np
+from subprocess import call
+import datetime
+from IPython import embed
+import sys
+from petsc4py import PETSc 
+from actuators import *
+from feedforward import *
+from feedback import *
+from integrators import *
+from mpl_toolkits.mplot3d import Axes3D                                          
+import matplotlib.pyplot as plt   
+
+# Form compiler options
+parameters["form_compiler"]["cpp_optimize"] = True
+parameters["form_compiler"]["optimize"] = True
+
+
+rint = 0.05668/2
+rest = 0.12
+res  = 3e-3
+### impongo l'offset nel file input di gmsh, genero e converto la mesh
+newline1='DefineConstant[ r1 = { %.4f, Path "Gmsh/Parameters"}];\n'  % rint
+newline2='DefineConstant[ r2 = { %.4f, Path "Gmsh/Parameters"}];\n'  %rest
+newline3='DefineConstant[ res= { %.4f, Path "Gmsh/Parameters"}];\n'  %res
+with open('geom/geom.geo') as fid:
+	lines = fid.readlines()
+lines[0] = lines[0].replace(lines[0], newline1)
+lines[1] = lines[1].replace(lines[1], newline2)
+lines[2] = lines[2].replace(lines[2], newline3)
+with open('geom/geom.geo', 'w') as fid2:
+	for line in lines:
+		fid2.write(line)
+
+
+
+call(["gmsh", "geom/geom.geo", "-2"])
+call(["dolfin-convert", "geom/geom.msh" , "geom/mesh.xml"])
+mesh = Mesh("geom/mesh.xml")
+
+
+L1 = FunctionSpace(mesh, 'Lagrange', 2)
+L2 = FunctionSpace(mesh, 'Lagrange', 3)
+L = MixedFunctionSpace([L2, L1, L1])
+
+
+#MATERIAL DATA#
+E = 9.1e+10#Pa
+nu = 0.24
+t = 0.00161
+rho = 2530##Kg/m^3
+
+
+
+t3 = t*t*t
+G = E/2/(1+nu)
+nu2 = nu*nu
+D_tensor = E*t3/12/(1-nu2)*as_tensor([    [   1  ,  nu  ,    0     ] ,\
+                                          [  nu  ,   1   ,    0    ] ,\
+                                          [   0  ,   0  , (1-nu)/2 ] ])
+
+M_tensor = rho*as_tensor([   [   t    ,   0      ,    0  ] ,\
+                             [   0    ,   t3/12  ,    0  ] ,\
+                             [   0    ,   0      , t3/12 ] ])
+
+
+def eps_fl(thx,thy):
+	"Computes flexional deformation vector according to mindlin plate"
+	mx = as_tensor([[0 , 0],\
+			[0 ,-1],\
+			[1 , 0]])
+	my = as_tensor([[1 , 0],\
+			[0 , 0],\
+			[0 ,-1]])
+	return mx*nabla_grad(thx)+my*nabla_grad(thy)
+      
+def eps_sh(w,thx,thy):
+	"Computes shear deformation vector according to mindlin plate"
+	mx = as_vector([0 , -1])
+	
+	my = as_vector([1 , 0])
+	return mx*thx+my*thy+nabla_grad(w)
+
+def StiffnessMatrix(test, trial):
+	"Computes stiffness matrix according with mindlin plate's theory"
+	(testw,testx,testy) = split(test)
+	(trialw,trialx,trialy) = split(trial)
+	return (inner(eps_fl(testx , testy) , D_tensor * eps_fl(trialx, trialy))+\
+	        inner(eps_sh(testw , testx , testy) , eps_sh(trialw , trialx , trialy) ) * G * t  ) *dx
+
+def LumpedStiffnessMatrix(test, trial):
+	"Computes lumped part of stiffness matrix according with mindlin plate's theory"
+	(testw,testx,testy) = split(test)
+	(trialw,trialx,trialy) = split(trial) 
+	output = inner(as_vector([testw, testx, testy]),\
+	         Lumped_K_tensor * as_vector([trialw, trialx, trialy]))
+	return output * dp(1)
+def MassMatrix(test, trial):
+	"Computes mass matrix according with mindlin plate's theory"
+	(testw,testx,testy) = split(test)
+	(trialw,trialx,trialy) = split(trial)
+	return inner(as_vector([testw, testx, testy]), M_tensor * as_vector([trialw, trialx, trialy])) * dx    
+def LumpedMassMatrix(test, trial):
+	"Computes lumped part of stiffness matrix according with mindlin plate's theory"
+	(testw,testx,testy) = split(test)
+	(trialw,trialx,trialy) = split(trial)
+	output = inner(as_vector([testw, testx, testy]),\
+	         Lumped_M_tensor * as_vector([trialw, trialx, trialy]))
+	return output * dp(1)
+def forcew(f,test,DX):
+	"Computes force"
+	(testw,testx,testy) = split(test)
+	output = inner(testw,f)
+	return output * DX
+
+
+
+
+
+#DIRICHLET BCS#
+#w#
+w_val = Constant(0.)
+class w_constraint(SubDomain):
+	def inside(self, x, on_boundary):
+		return  on_boundary and x[0]*x[0]+x[1]*x[1]<rint*rint*1.1
+w_Constraint = w_constraint()
+w_boundaries = MeshFunction("size_t", mesh, 1)
+w_boundaries.set_all(0)
+w_Constraint.mark(w_boundaries, 1)#set 1 to activate, , 0 to deactivate
+w_bc = DirichletBC(L.sub(0), w_val, w_boundaries,1)
+#theta_x#
+theta_x_val = Constant(0.)
+class theta_x_constraint(SubDomain):
+	def inside(self, x, on_boundary):
+		return  on_boundary and x[0]*x[0]+x[1]*x[1]<rint*rint*1.1
+theta_x_Constraint = theta_x_constraint()
+theta_x_boundaries = MeshFunction("size_t", mesh, 1)
+theta_x_boundaries.set_all(0)
+theta_x_Constraint.mark(theta_x_boundaries, 0)#set 1 to activate, 0 to deactivate
+theta_x_bc = DirichletBC(L.sub(1), theta_x_val, theta_x_boundaries,1)
+#theta_y#
+theta_y_val = Constant(0.)
+class theta_y_constraint(SubDomain):
+	def inside(self, x, on_boundary):
+		return  on_boundary and x[0]*x[0]+x[1]*x[1]<rint*rint*1.1
+theta_y_Constraint = theta_y_constraint()
+theta_y_boundaries = MeshFunction("size_t", mesh, 1)
+theta_y_boundaries.set_all(0)
+theta_y_Constraint.mark(theta_y_boundaries, 0)#set 1 to activate,q 0 to deactivate
+theta_y_bc = DirichletBC(L.sub(2), theta_y_val, theta_y_boundaries,1)
+
+bcs = [ w_bc]# , theta_x_bc , theta_y_bc ]
+
+
+
+#LUMPED PARAMETERS#
+Lumped_K_tensor = as_tensor([    [ -87.4 , 0.          , 0.           ],\
+                                 [ 0.           , 7e-5 , 0.           ],\
+                                 [ 0.           , 0.          ,  7e-5 ]])
+
+Lumped_M_tensor = as_tensor([    [ 4.3201e-3 , 0.        , 0.        ],\
+                                 [ 0.        , 1.6418e-7 , 0.        ],\
+                                 [ 0.        , 0.        , 1.6418e-7 ]])
+
+act_coords = np.load("data/act_coords.npy")
+act = ActList(L, act_coords)
+n_act = np.shape(act_coords)[0]
+lumped_boundaries = MeshFunction("size_t", mesh, 0)
+lumped_boundaries.set_all(0)
+
+#act.mark(lumped_boundaries,20,0)
+#act.mark(lumped_boundaries,44,44)
+
+dp = act.dp_all()
+#act.plot_coords()
+#plot(lumped_boundaries, title = 'actuators')
+#plot(w_boundaries, title = 'w constraint region')
+#plot(theta_x_boundaries, title = 'theta_x constraint region')
+#plot(theta_y_boundaries, title = 'theta_y constraint region')
+#interactive()
+#exit()
+
+#NORMAL MODES BUILDING#
+test = TestFunction(L)
+trial = TrialFunction(L)
+
+#K#
+print "Assembling K"
+K = assemble(StiffnessMatrix(test,trial)+LumpedStiffnessMatrix(test,trial))
+#assemble(StiffnessMatrix(test,trial), tensor=K)
+#for bc in bcs: bc.apply(K)
+
+#M#
+print "Assembling M"
+lflag = True #set True to lump
+if lflag:
+	#print 'Assembling lumped mass'
+	mass_form = MassMatrix(test,trial)+LumpedMassMatrix(test,trial)
+	I = Constant([1,0,0])
+	mass_action_form = action(mass_form,I)
+	M = assemble(mass_form)
+	M.zero()
+	M.set_diagonal(assemble(mass_action_form))
+else:
+	#print 'Assembling consistent mass'
+	M = assemble(MassMatrix(test,trial)+LumpedMassMatrix(test,trial))
+#assemble(MassMatrix(test,trial), tensor=M)
+#for bc in bcs: bc.zero(M)
+
+#C#
+print "Assembling C"
+c_K = 3e-6
+c_M = 6.3
+C = c_K*K + c_M * M
+
+
+
+
+
+
+# Start time
+t0 = 0
+#dt
+dt = 1./80000.
+idt = dt/4
+# Period of 1 step
+T = 1e-3
+
+
+
+#FORMA DA ASSUMERE
+amplitude = 5e-8
+udes = np.zeros(n_act)
+
+class MyExpression0(Expression):
+    def eval(self, value, x):
+       R = sqrt(pow(x[0],2)+pow(x[1],2))/rest
+       th = np.arctan2(x[1],x[0])
+       
+       #value[0] = 1                                                                 #0
+       #value[0] = R*cos(th)                                                         #1
+       #value[0] = R*sin(th)                                                         #2
+       #value[0] = 2*pow(R,2)-1                                                      #3
+       #value[0] = pow(R,2)*cos(2*th)                                                #4
+       #value[0] = pow(R,2)*sin(2*th)                                                #5 
+       #value[0] = (3*pow(R,2)-2)*R*cos(th)                                          #6
+       #value[0] = (3*pow(R,2)-2)*R*sin(th)                                          #7
+       #value[0] = 6*pow(R,4)-6*pow(R,2)+1                                           #8
+       #value[0] = pow(R,3)*cos(3*th)                                                #9
+       #value[0] = pow(R,3)*sin(3*th)                                                #10
+       #value[0] = (4*pow(R,2)-3)*pow(R,2)*cos(2*th)                                 #11
+       #value[0] = (4*pow(R,2)-3)*pow(R,2)*sin(2*th)                                 #12
+       #value[0] = 10*pow(R,4)-12*pow(R,2)+3)*R*cos(th)                              #13
+       value[0] = 10*pow(R,4)-12*pow(R,2)+3)*R*sin(th)                              #14
+       #value[0] = 20*pow(R,6)-30*pow(R,4)+12*pow(R,2)-1                             #15
+       #value[0] = pow(R,4)*cos(4*th)                                                #16
+       #value[0] = pow(R,4)*sin(4*th)                                                #17
+       #value[0] = (5*pow(R,2)-4)*pow(R,3)*cos(2*th)                                 #18
+       #value[0] = (5*pow(R,2)-4)*pow(R,3)*sin(2*th)                                 #19
+       #value[0] = (15*pow(R,4)-20*pow(R,2)+6)*pow(R,2)*cos(2*th)                    #20
+       #value[0] = (15*pow(R,4)-20*pow(R,2)+6)*pow(R,2)*sin(2*th)                    #21
+       #value[0] = (35*pow(R,6)-60*pow(R,4)+30*pow(R,2)-4)*R*cos(th)                 #22
+       #value[0] = (35*pow(R,6)-60*pow(R,4)+30*pow(R,2)-4)*R*sin(th)                 #23
+       #value[0] = 70*pow(R,8)-140*pow(R,6)+90*pow(R,4)-20*pow(R,2)+1                #24
+    def value_shape(self):                                                            
+        return (1,)                                                                   
+pippo = MyExpression0(element = L.sub(0).ufl_element())                               
+                                                                                      
+for i in act.act_id:                                                                  
+  udes[i] = amplitude*pippo(act.point(i))                                             
+                                                                                      
+#udes =1e-7*np.ones(n_act)                                                            
+                                                                                      
+                                                                                      
+                                                                                      
+                                                                                      
+                                                                                      
+                                                                                      
+                                                                                      
+flag = False   # set True to insert the reading error simulation (in ff & fb)          
+                                                                                      
+                                                                                      
+#FEEDFORWARD                                                                          
+ff = FeedForward(udes, T,flag)                                                        
+ff.alfa = c_M                                                                         
+ff.beta = c_K                                                                         
+ff.recompute_C()                                                                      
+
+#FEEDBACK
+gp =80000
+gd = 70
+fb = FeedBack(act,dt,gp*np.ones(n_act),gd*np.ones(n_act),flag)
+
+
+
+a = act.dp_all()
+f = forcew(Constant(0),test,dp(1))
+F = assemble(f)
+
+
+#1st step (eulero)
+time = dt
+itime = idt
+trace = np.zeros(n_act)
+tv = np.array([0])
+
+
+amp = ff.force(time)
+for i in range(n_act): 
+  delta = PointSource(L.sub(0), act.point(i), amp[i])
+  delta.apply(F)
+  
+eu = Eulero(L, M, C, K, idt)
+eu.initialize(np.zeros(np.shape(F.array())),np.zeros(np.shape(F.array())))
+eu.integrate(F)
+
+
+utemp0 = Function(L)
+utemp0.vector()[:] = 0
+utemp1 = Function(L)
+utemp1.vector()[:] = 0
+udtemp = Function(L)
+udtemp.vector()[:] = 0
+
+
+
+itime +=idt
+
+#mante
+
+mnt = Mantegazza(L, M, C, K, idt, 1)
+mnt.initialize(eu.u.vector(), eu.ud.vector(), eu.udd.vector(),\
+               eu.uold.vector(),eu.udold.vector(),eu.uddold.vector())
+p = plot(eu.u.sub(0),title="shape", range_max = 7.5e-8 , range_min = -7.5e-8, window_width = 1920 , window_height = 1080)
+while itime <= T:
+  if itime >= time-itime/10:
+    F[:] = 0
+    cforce = fb.force(utemp1,udtemp,ff.shapew(time),ff.shapewd(time))
+    oforce = ff.force(time)
+    amp = cforce+oforce
+    for i in range(n_act): 
+      delta = PointSource(L.sub(0), act.point(i), amp[i])
+      delta.apply(F)
+  mnt.integrate(F)
+  mnt.update()
+  p.plot(mnt.u.sub(0))
+  if itime >= time-itime/10:
+    utemp0.assign(utemp1)
+    utemp1.assign(mnt.u)
+    udtemp.assign((utemp1-utemp0)/dt)
+    #trace = np.append(trace, act.disp2disp_all(mnt.u))
+    trace = np.append(trace, mnt.u.sub(0).compute_vertex_values()[act.vertex_id])
+    tv = np.append(tv,itime)
+    time += dt
+    
+  itime += idt
+  
+  
+  
+interactive()  
+
+trace = trace.reshape(np.size(tv),n_act)
+trace = trace.transpose()
+ref = ff.get_story(0,tv)
+ref2 = ff.get_story(44,tv)
+fig = plt.figure()
+ax = fig.add_subplot(211)
+ax.plot(tv, trace[0],  c='r', marker = '8')  
+ax.plot(tv, ref[0,:], c = 'b')
+ax2 = fig.add_subplot(212)
+ax2.plot(tv, trace[44],  c='r', marker = '8')  
+ax2.plot(tv, ref2[0,:], c = 'b')
+plt.show()
+plt.show()
+
+#embed()
+np.savetxt('14u1.dat', np.append(tv*1000,trace[0]*1e9).reshape(2,np.size(tv)).transpose())
+np.savetxt('14ref1.dat', np.append(tv*1000,ref[0,:]*1e9).reshape(2,np.size(tv)).transpose())
+np.savetxt('14u2.dat', np.append(tv*1000,trace[44]*1e9).reshape(2,np.size(tv)).transpose())
+np.savetxt('14ref2.dat', np.append(tv*1000,ref2[0,:]*1e9).reshape(2,np.size(tv)).transpose())
+np.savetxt('14ref2+10.dat', np.append(tv*1000,ref2[0,:]*1e9+10).reshape(2,np.size(tv)).transpose())
+np.savetxt('14ref2-10.dat', np.append(tv*1000,ref2[0,:]*1e9-10).reshape(2,np.size(tv)).transpose())
+np.savetxt('14ref1+10.dat', np.append(tv*1000,ref[0,:]*1e9+10).reshape(2,np.size(tv)).transpose())
+np.savetxt('14ref1-10.dat', np.append(tv*1000,ref[0,:]*1e9-10).reshape(2,np.size(tv)).transpose())
+

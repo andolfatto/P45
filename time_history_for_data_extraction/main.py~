@@ -1,0 +1,432 @@
+#export OMP_NUM_THREADS=1
+from dolfin import *
+import numpy as np
+from subprocess import call
+import datetime
+from IPython import embed
+import sys
+from petsc4py import PETSc 
+from actuators import *
+from feedforward import *
+from feedback import *
+from integrators import *
+from mpl_toolkits.mplot3d import Axes3D                                          
+import matplotlib.pyplot as plt  
+import time as tempo
+
+# Form compiler options
+parameters["form_compiler"]["cpp_optimize"] = True
+parameters["form_compiler"]["optimize"] = True
+
+
+rint = 0.05668/2
+rest = 0.12
+res  = 1e-2
+### impongo l'offset nel file input di gmsh, genero e converto la mesh
+newline1='DefineConstant[ r1 = { %.4f, Path "Gmsh/Parameters"}];\n'  % rint
+newline2='DefineConstant[ r2 = { %.4f, Path "Gmsh/Parameters"}];\n'  %rest
+newline3='DefineConstant[ res= { %.4f, Path "Gmsh/Parameters"}];\n'  %res
+with open('geom/geom.geo') as fid:
+	lines = fid.readlines()
+lines[0] = lines[0].replace(lines[0], newline1)
+lines[1] = lines[1].replace(lines[1], newline2)
+lines[2] = lines[2].replace(lines[2], newline3)
+with open('geom/geom.geo', 'w') as fid2:
+	for line in lines:
+		fid2.write(line)
+
+
+
+call(["gmsh", "geom/geom.geo", "-2"])
+call(["dolfin-convert", "geom/geom.msh" , "geom/mesh.xml"])
+mesh = Mesh("geom/mesh.xml")
+
+
+L1 = FunctionSpace(mesh, 'Lagrange', 2)
+L2 = FunctionSpace(mesh, 'Lagrange', 3)
+L = MixedFunctionSpace([L2, L1, L1])
+
+
+#MATERIAL DATA#
+E = 9.1e+10#Pa
+nu = 0.24
+t = 0.00161
+rho = 2530##Kg/m^3
+
+
+
+t3 = t*t*t
+G = E/2/(1+nu)
+nu2 = nu*nu
+D_tensor = E*t3/12/(1-nu2)*as_tensor([    [   1  ,  nu  ,    0     ] ,\
+                                          [  nu  ,   1   ,    0    ] ,\
+                                          [   0  ,   0  , (1-nu)/2 ] ])
+
+M_tensor = rho*as_tensor([   [   t    ,   0      ,    0  ] ,\
+                             [   0    ,   t3/12  ,    0  ] ,\
+                             [   0    ,   0      , t3/12 ] ])
+
+
+def eps_fl(thx,thy):
+	"Computes flexional deformation vector according to mindlin plate"
+	mx = as_tensor([[0 , 0],\
+			[0 ,-1],\
+			[1 , 0]])
+	my = as_tensor([[1 , 0],\
+			[0 , 0],\
+			[0 ,-1]])
+	return mx*nabla_grad(thx)+my*nabla_grad(thy)
+      
+def eps_sh(w,thx,thy):
+	"Computes shear deformation vector according to mindlin plate"
+	mx = as_vector([0 , -1])
+	
+	my = as_vector([1 , 0])
+	return mx*thx+my*thy+nabla_grad(w)
+
+def StiffnessMatrix(test, trial):
+	"Computes stiffness matrix according with mindlin plate's theory"
+	(testw,testx,testy) = split(test)
+	(trialw,trialx,trialy) = split(trial)
+	return (inner(eps_fl(testx , testy) , D_tensor * eps_fl(trialx, trialy))+\
+	        inner(eps_sh(testw , testx , testy) , eps_sh(trialw , trialx , trialy) ) * G * t  ) *dx
+
+def LumpedStiffnessMatrix(test, trial):
+	"Computes lumped part of stiffness matrix according with mindlin plate's theory"
+	(testw,testx,testy) = split(test)
+	(trialw,trialx,trialy) = split(trial) 
+	output = inner(as_vector([testw, testx, testy]),\
+	         Lumped_K_tensor * as_vector([trialw, trialx, trialy]))
+	return output * dp(1)
+def MassMatrix(test, trial):
+	"Computes mass matrix according with mindlin plate's theory"
+	(testw,testx,testy) = split(test)
+	(trialw,trialx,trialy) = split(trial)
+	return inner(as_vector([testw, testx, testy]), M_tensor * as_vector([trialw, trialx, trialy])) * dx    
+def LumpedMassMatrix(test, trial):
+	"Computes lumped part of stiffness matrix according with mindlin plate's theory"
+	(testw,testx,testy) = split(test)
+	(trialw,trialx,trialy) = split(trial)
+	output = inner(as_vector([testw, testx, testy]),\
+	         Lumped_M_tensor * as_vector([trialw, trialx, trialy]))
+	return output * dp(1)
+def forcew(f,test,DX):
+	"Computes force"
+	(testw,testx,testy) = split(test)
+	output = inner(testw,f)
+	return output * DX
+def forceall(f,test,DX):
+	"Computes force"
+	(testw,testx,testy) = split(test)
+	output = inner(testw,f[0])+inner(testx,f[1])+inner(testy,f[2])
+	return output * DX
+
+
+
+
+#DIRICHLET BCS#
+#w#
+w_val = Constant(0.)
+class w_constraint(SubDomain):
+	def inside(self, x, on_boundary):
+		return  on_boundary and x[0]*x[0]+x[1]*x[1]<rint*rint*1.1
+w_Constraint = w_constraint()
+w_boundaries = MeshFunction("size_t", mesh, 1)
+w_boundaries.set_all(0)
+w_Constraint.mark(w_boundaries, 1)#set 1 to activate, , 0 to deactivate
+w_bc = DirichletBC(L.sub(0), w_val, w_boundaries,1)
+#theta_x#
+theta_x_val = Constant(0.)
+class theta_x_constraint(SubDomain):
+	def inside(self, x, on_boundary):
+		return  on_boundary and x[0]*x[0]+x[1]*x[1]<rint*rint*1.1
+theta_x_Constraint = theta_x_constraint()
+theta_x_boundaries = MeshFunction("size_t", mesh, 1)
+theta_x_boundaries.set_all(0)
+theta_x_Constraint.mark(theta_x_boundaries, 0)#set 1 to activate, 0 to deactivate
+theta_x_bc = DirichletBC(L.sub(1), theta_x_val, theta_x_boundaries,1)
+#theta_y#
+theta_y_val = Constant(0.)
+class theta_y_constraint(SubDomain):
+	def inside(self, x, on_boundary):
+		return  on_boundary and x[0]*x[0]+x[1]*x[1]<rint*rint*1.1
+theta_y_Constraint = theta_y_constraint()
+theta_y_boundaries = MeshFunction("size_t", mesh, 1)
+theta_y_boundaries.set_all(0)
+theta_y_Constraint.mark(theta_y_boundaries, 0)#set 1 to activate,q 0 to deactivate
+theta_y_bc = DirichletBC(L.sub(2), theta_y_val, theta_y_boundaries,1)
+
+bcs = [ w_bc]# , theta_x_bc , theta_y_bc ]
+
+
+
+#LUMPED PARAMETERS#
+Lumped_K_tensor = as_tensor([    [ -87.4 , 0.          , 0.           ],\
+                                 [ 0.           , 7e-5 , 0.           ],\
+                                 [ 0.           , 0.          ,  7e-5 ]])
+
+Lumped_M_tensor = as_tensor([    [ 4.3201e-3 , 0.        , 0.        ],\
+                                 [ 0.        , 1.6418e-7 , 0.        ],\
+                                 [ 0.        , 0.        , 1.6418e-7 ]])
+
+act_coords = np.load("data/act_coords.npy")
+act = ActList(L, act_coords)
+n_act = np.shape(act_coords)[0]
+lumped_boundaries = MeshFunction("size_t", mesh, 0)
+lumped_boundaries.set_all(0)
+
+#act.mark(lumped_boundaries,20,0)
+#act.mark(lumped_boundaries,44,44)
+
+dp = act.dp_all()
+#act.plot_coords()
+#plot(lumped_boundaries, title = 'actuators')
+#plot(w_boundaries, title = 'w constraint region')
+#plot(theta_x_boundaries, title = 'theta_x constraint region')
+#plot(theta_y_boundaries, title = 'theta_y constraint region')
+#interactive()
+#exit()
+
+#NORMAL MODES BUILDING#
+test = TestFunction(L)
+trial = TrialFunction(L)
+
+#K#
+print "Assembling K"
+K = assemble(StiffnessMatrix(test,trial)+LumpedStiffnessMatrix(test,trial))
+#assemble(StiffnessMatrix(test,trial), tensor=K)
+#for bc in bcs: bc.apply(K)
+
+#M#
+print "Assembling M"
+lflag = False #set True to lump
+if lflag:
+	#print 'Assembling lumped mass'
+	mass_form = MassMatrix(test,trial)+LumpedMassMatrix(test,trial)
+	I = Constant([1,0,0])
+	mass_action_form = action(mass_form,I)
+	M = assemble(mass_form)
+	M.zero()
+	M.set_diagonal(assemble(mass_action_form))
+else:
+	#print 'Assembling consistent mass'
+	M = assemble(MassMatrix(test,trial)+LumpedMassMatrix(test,trial))
+#assemble(MassMatrix(test,trial), tensor=M)
+#for bc in bcs: bc.zero(M)
+
+#C#
+print "Assembling C"
+csi1 = .5
+csi2 = 1e-3
+fre1 = 1
+fre2 = 1e3
+Z = np.array([1/(2*np.pi*fre1), (2*np.pi*fre1), 1/(2*np.pi*fre2), (2*np.pi*fre2)  ]).reshape(2,2)
+Q = np.array([2*csi1, 2*csi2])
+alfabeta = np.linalg.solve(Z,Q)
+print alfabeta[0]
+print alfabeta[1]
+
+#alfabeta = [6.28, 0]
+C = alfabeta[0]* M + alfabeta[1]*K
+
+
+
+                                                                                
+#random offset for actuators
+gamma = 0
+mean_offset = 0.5e-3
+mux = mean_offset*np.cos(gamma)
+muy = mean_offset*np.sin(gamma)
+sigma = 0.2e-3
+offx = np.zeros(n_act)
+offy = np.zeros(n_act)
+for i in range(n_act):
+  offx[i] = np.random.normal(mux,sigma)   
+  offy[i] = np.random.normal(muy,sigma)
+
+
+
+# Start time
+t0 = 0
+#dt
+dt = 1./80000.
+idt = dt/3
+# Period of 1 step
+T = 1e-3
+
+                                                                                   
+                                                                                      
+steps = np.loadtxt("data/story_P45.bin")
+udes =1e-7*np.ones(n_act)                                                                                          
+                                                                                      
+                                                                                      
+flag = True  # set True to insert the reading error simulation (in ff & fb)          
+                                                                                      
+                                                                                      
+#FEEDFORWARD                                                                          
+ff = FeedForward(udes, udes, T, act, flag)
+ff.alfa = alfabeta[0]                                                                         
+ff.beta = alfabeta[1]                                                                 
+ff.recompute_C()                                                                      
+
+#FEEDBACK
+gp =20000
+gd = 20
+fb = FeedBack(act,dt,gp*np.ones(n_act),gd*np.ones(n_act),flag)
+
+
+
+
+f = forcew(Constant(0),test,dx)
+fcost = 0
+
+#######################ENABLE THESE LINES TO ACTIVATE GRAVITY##############################
+a_d_o = pi/4###angolo di orientazione rispetto all'orizzontale
+f = forcew(Constant(9.81*cos(a_d_o)*rho*t),test,dx)+forcew(Constant(-0.2507+9.81*cos(a_d_o)*4.3201e-3),test, dp(1))
+fcost = -np.sum(assemble(forcew(Constant(9.81*cos(a_d_o)*rho*t),test,dx)).array())/n_act+0.2507-9.81*cos(a_d_o)*4.3201e-3
+#############################################################################################
+
+
+F = assemble(f)
+fvect = assemble(f)
+fvect[:] = F[:]
+
+
+eu = Eulero(L, M, C, K, idt)
+mnt = Mantegazza(L, M, C, K, idt)
+tv = np.array([0])
+trace = np.zeros(n_act).reshape(n_act,1)
+tracetrue = np.zeros(n_act).reshape(n_act,1)
+ref = np.zeros(n_act).reshape(n_act,1)
+
+
+oxystoring = np.zeros(n_act).reshape(n_act,1)
+oxy = np.zeros(n_act)
+foxystoring = np.zeros(n_act).reshape(n_act,1)
+foxy = np.zeros(n_act)
+oxycount = 0
+
+utemp0 = Function(L)
+utemp0.vector()[:] = 0
+utemp1 = Function(L)
+utemp1.vector()[:] = 0
+udtemp = Function(L)
+udtemp.vector()[:] = 0
+ 
+#############################
+#for new force update methods
+dpact = act.dp()
+Cons0 = []
+Cons1 = []
+Cons2 = []
+Cons0.append(Constant(0.))
+Cons1.append(Constant(0.))
+Cons2.append(Constant(0.))
+Fform = forceall([Cons0[0],Cons1[0],Cons2[0]],test,dpact(1))
+for i in range(1,n_act):	
+  Cons0.append(Constant(0.))
+  Cons1.append(Constant(0.))
+  Cons2.append(Constant(0.))
+  Fform += forceall([Cons0[i],Cons1[i],Cons2[i]],test,dpact(i+1))
+#############################
+
+tic = tempo.clock()
+for step in range(int(np.shape(steps)[0]/2.3)):
+#for step in range(40):
+  print step
+  ff.u = steps[step,:]
+  if step == 0: 
+    ff.uold = np.zeros(np.size(ff.u))
+  else:
+    ff.uold = steps[step-1,:]  
+    #oxy = oxystoring.sum(1)/oxycount
+    #foxy = foxystoring.sum(1)/oxycount 
+    #ff.uold[:] = oxy[:]
+    #print 'oxy'
+    #oxystoring = np.zeros(n_act).reshape(n_act,1)
+    #oxycount = 0.
+    #oxy = np.zeros(n_act)    
+    #foxystoring = np.zeros(n_act).reshape(n_act,1)
+  #1st step (eulero)
+  time = dt
+  itime = idt
+  localtime = np.array([])
+  if step == 0:
+    amp = ff.force(time)+fcost
+    for i in range(n_act): 
+      delta = PointSource(L.sub(0), act.point(i), amp[i])
+      delta.apply(F)
+    eu.initialize(np.zeros(np.shape(F.array())),np.zeros(np.shape(F.array())))
+    eu.integrate(F)
+    p = plot(eu.u.sub(0),title="shape", range_max = 7.5e-6 , range_min = -7.5e-6, window_width = 1920 , window_height = 1080)
+    itime +=idt
+    mnt.initialize(eu.u.vector(), eu.ud.vector(), eu.udd.vector(),\
+                 eu.uold.vector(),eu.udold.vector(),eu.uddold.vector())
+
+
+
+  while itime <= T:
+    if itime >= time-itime/10:
+      #F[:] = fvect[:]
+      cforce = fb.weird_force(utemp1,udtemp,ff.shapew(time),ff.shapewd(time),mnt.u,offx,offy)
+      oforce = ff.weird_force(time, mnt.u,offx,offy)
+      amp1 = cforce[:,0]+oforce[:,0]+fcost
+      #if step <6:
+	#oforce = ff.weird_force(time, mnt.u,offx,offy)
+	#amp1 = cforce[:,0]+oforce[:,0]+fcost
+
+      #else:
+	#oforce = ff.weird_oxyforce(time, mnt.u,foxy,offx,offy)
+        #amp1 = cforce[:,0]+oforce[:,0]
+      amp2 = cforce[:,1]+oforce[:,1]
+      amp3 = cforce[:,2]+oforce[:,2]
+      for i in range(n_act):	
+        Cons0[i].assign(amp1[i])
+	Cons1[i].assign(amp2[i])
+	Cons2[i].assign(amp3[i])
+      #if time>3*T/4:
+	#oxycount += 1
+        #oxystoring = np.transpose(np.append(np.transpose(oxystoring), np.transpose(utemp1.sub(0).compute_vertex_values()[act.vertex_id])).\
+	      #reshape(oxycount+1,n_act))
+	#foxystoring = np.transpose(np.append(np.transpose(foxystoring), np.transpose(amp1)).\
+	      #reshape(oxycount+1,n_act))
+
+    F = assemble(Fform)
+    F[:] += fvect
+    mnt.integrate(F)
+    mnt.update()
+    p.plot(mnt.u.sub(0))
+  
+    
+    if itime >= time-itime/10:
+      localtime = np.append(localtime,time)
+      utemp0.assign(utemp1)
+      utemp1.assign(mnt.u)
+      udtemp.assign((utemp1-utemp0)/dt)
+      trace = np.transpose(np.append(np.transpose(trace), np.transpose(act.disp2disp_all(mnt.u))).\
+	      reshape(np.shape(trace)[1]+1,np.shape(trace)[0]))
+      tracetrue = np.transpose(np.append(np.transpose(tracetrue), np.transpose(mnt.u.compute_vertex_values()[act.vertex_id])).\
+	      reshape(np.shape(tracetrue)[1]+1,np.shape(tracetrue)[0]))
+      tv = np.append(tv,itime+step*T)
+      time += dt
+    itime += idt
+    
+  ref = np.transpose(np.append(np.transpose(ref), np.transpose(ff.get_all_stories(localtime))).\
+	      reshape(np.shape(ref)[1]+np.size(localtime),np.shape(ref)[0]))
+toc = tempo.clock()
+print toc - tic
+#interactive()  
+np.savetxt('3u.dat', np.append(tv*1000,trace[0]*1e9).reshape(2,np.size(tv)).transpose())
+np.savetxt('3utrue.dat', np.append(tv*1000,tracetrue[0]*1e9).reshape(2,np.size(tv)).transpose())
+
+fig = plt.figure()
+ax = fig.add_subplot(211)
+ax.plot(tv, tracetrue[0,:],  c='r', marker = '8')  
+ax.plot(tv, ref[0,:], c = 'b')
+ax.plot(tv, ref[0,:]+2e-8, c = 'b')
+ax.plot(tv, ref[0,:]-2e-8, c = 'b')
+ax2 = fig.add_subplot(212)
+ax2.plot(tv, tracetrue[44,:],  c='r', marker = '8')  
+ax2.plot(tv, ref[44,:], c = 'b')
+plt.show()
+plt.show()
